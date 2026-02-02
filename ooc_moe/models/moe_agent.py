@@ -242,9 +242,12 @@ class MoERLAgent(nn.Module):
         
         # Track experts used across layers
         self.experts_used: List[int] = []
-        
+
         # Initialize weights
         self._init_weights()
+
+        # Move entire model to specified device
+        self.to(device)
     
     def _init_weights(self):
         """Initialize weights with small values for stability."""
