@@ -205,7 +205,7 @@ class MoERLAgent(nn.Module):
         self.action_embedding = nn.Embedding(num_actions, expert_dim)
         self.reward_embedding = nn.Linear(1, expert_dim)
         
-        # Transformer blocks with MoE
+        # Transformer blocks with MoE (environment-aware for specialization)
         self.transformer_blocks = nn.ModuleList([
             MoETransformerBlock(
                 dim=expert_dim,
@@ -214,6 +214,8 @@ class MoERLAgent(nn.Module):
                 ffn_hidden_dim=expert_hidden_dim,
                 top_k=top_k,
                 dropout=dropout,
+                num_envs=num_envs,
+                env_specialization_strength=2.0,  # Configurable
             )
             for _ in range(num_layers)
         ])
@@ -321,14 +323,19 @@ class MoERLAgent(nn.Module):
         # Create causal attention mask
         causal_mask = self._create_causal_mask(seq_len, device)
         
-        # Forward through transformer blocks
+        # Forward through transformer blocks (with environment-aware routing)
         total_aux_loss = 0.0
         self.experts_used = []
-        
+
         for block in self.transformer_blocks:
-            x, aux_loss = block(x, attention_mask=causal_mask, context_hash=context_hash)
+            x, aux_loss = block(
+                x,
+                attention_mask=causal_mask,
+                context_hash=context_hash,
+                env_id=env_id,  # Pass env_id for specialization
+            )
             total_aux_loss = total_aux_loss + aux_loss
-            
+
             # Track experts used
             routing_stats = block.get_last_routing_stats()
             if 'expert_usage' in routing_stats:

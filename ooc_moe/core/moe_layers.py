@@ -29,11 +29,11 @@ class RouterOutput(NamedTuple):
 class ExpertRouter(nn.Module):
     """
     Router network that selects experts for each input.
-    
+
     This is always kept in HBM as it's small and accessed on every forward pass.
-    Implements top-k routing with load balancing.
+    Implements top-k routing with load balancing and environment-aware biasing.
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -41,6 +41,8 @@ class ExpertRouter(nn.Module):
         top_k: int = 2,
         noise_std: float = 0.1,
         capacity_factor: float = 1.25,
+        num_envs: int = 1,
+        env_specialization_strength: float = 2.0,
     ):
         """
         Args:
@@ -49,60 +51,98 @@ class ExpertRouter(nn.Module):
             top_k: Number of experts to select per input
             noise_std: Std of noise added during training for exploration
             capacity_factor: Multiplier for expert capacity (for load balancing)
+            num_envs: Number of environments/games for specialization
+            env_specialization_strength: How strongly to bias routing by environment
         """
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.noise_std = noise_std
         self.capacity_factor = capacity_factor
-        
+        self.num_envs = num_envs
+        self.env_specialization_strength = env_specialization_strength
+
         # Router is a simple linear projection
         self.router = nn.Linear(input_dim, num_experts, bias=False)
-        
+
+        # Environment-specific expert bias: learns which experts prefer which envs
+        # Shape: [num_envs, num_experts]
+        self.env_expert_bias = nn.Parameter(torch.zeros(num_envs, num_experts))
+
         # Initialize with small weights for stable routing initially
         nn.init.normal_(self.router.weight, std=0.01)
-    
+
+        # Initialize env biases to create initial expert partitions
+        # Each env starts with a preference for a subset of experts
+        self._init_env_partitions()
+
+    def _init_env_partitions(self):
+        """Initialize environment biases to create soft expert partitions."""
+        if self.num_envs <= 1:
+            return
+
+        # Divide experts roughly equally among environments
+        experts_per_env = self.num_experts // self.num_envs
+
+        with torch.no_grad():
+            # Start with slight negative bias everywhere
+            self.env_expert_bias.fill_(-0.5)
+
+            # Each environment gets positive bias for its partition
+            for env_id in range(self.num_envs):
+                start_idx = env_id * experts_per_env
+                end_idx = start_idx + experts_per_env
+                if env_id == self.num_envs - 1:
+                    end_idx = self.num_experts  # Last env gets remaining experts
+                self.env_expert_bias[env_id, start_idx:end_idx] = 1.0
+
     def forward(
-        self, 
+        self,
         x: Tensor,
-        training: bool = True
+        training: bool = True,
+        env_id: Optional[int] = None,
     ) -> RouterOutput:
         """
         Route inputs to experts.
-        
+
         Args:
             x: Input tensor of shape [batch, dim]
             training: Whether we're in training mode (adds noise)
-            
+            env_id: Current environment ID for specialization bias
+
         Returns:
             RouterOutput with selected experts and weights
         """
         batch_size = x.shape[0]
-        
+
         # Compute router logits
         router_logits = self.router(x)  # [batch, num_experts]
-        
+
+        # Add environment-specific bias if env_id provided
+        if env_id is not None and self.num_envs > 1:
+            env_bias = self.env_expert_bias[env_id]  # [num_experts]
+            router_logits = router_logits + self.env_specialization_strength * env_bias
+
         # Add noise during training for exploration
         if training and self.noise_std > 0:
             noise = torch.randn_like(router_logits) * self.noise_std
             noisy_logits = router_logits + noise
         else:
             noisy_logits = router_logits
-        
+
         # Top-k selection
         top_k_logits, top_k_indices = torch.topk(
             noisy_logits, self.top_k, dim=-1
         )  # [batch, top_k]
-        
+
         # Softmax over selected experts for combination weights
         expert_weights = F.softmax(top_k_logits, dim=-1)  # [batch, top_k]
-        
-        # Compute load balancing loss
-        # This encourages uniform expert utilization
+
+        # Compute load balancing loss (within-environment balancing, not global)
         load_balancing_loss = self._compute_load_balancing_loss(
-            router_logits, top_k_indices, batch_size
+            router_logits, top_k_indices, batch_size, env_id
         )
-        
+
         return RouterOutput(
             expert_indices=top_k_indices,
             expert_weights=expert_weights,
@@ -114,32 +154,45 @@ class ExpertRouter(nn.Module):
         self,
         router_logits: Tensor,
         selected_experts: Tensor,
-        batch_size: int
+        batch_size: int,
+        env_id: Optional[int] = None,
     ) -> Tensor:
         """
         Compute auxiliary loss for load balancing.
-        
-        From Switch Transformer paper: encourages routing decisions
-        to be spread across experts rather than collapsing to few.
+
+        When env_id is provided, only balances within that environment's
+        expert subset (encourages specialization while maintaining balance
+        within each game's expert cohort).
         """
         # Fraction of tokens routed to each expert
-        # selected_experts: [batch, top_k]
         expert_mask = F.one_hot(selected_experts, self.num_experts).float()
-        # [batch, top_k, num_experts] -> [batch, num_experts]
         expert_mask = expert_mask.sum(dim=1)
         tokens_per_expert = expert_mask.sum(dim=0)  # [num_experts]
         fraction_tokens = tokens_per_expert / batch_size
-        
+
         # Router probability for each expert
         router_probs = F.softmax(router_logits, dim=-1)  # [batch, num_experts]
         mean_router_prob = router_probs.mean(dim=0)  # [num_experts]
-        
-        # Load balancing loss: dot product of fractions and probs
-        # Minimized when both are uniform
-        load_balance_loss = (
-            self.num_experts * (fraction_tokens * mean_router_prob).sum()
-        )
-        
+
+        # If env_id provided and we have multiple envs, only balance within subset
+        if env_id is not None and self.num_envs > 1:
+            # Get the environment's expert mask (where bias is positive)
+            env_mask = (self.env_expert_bias[env_id] > 0).float()
+            num_env_experts = env_mask.sum().clamp(min=1)
+
+            # Only balance among this environment's preferred experts
+            fraction_tokens = fraction_tokens * env_mask
+            mean_router_prob = mean_router_prob * env_mask
+
+            load_balance_loss = (
+                num_env_experts * (fraction_tokens * mean_router_prob).sum()
+            )
+        else:
+            # Standard global load balancing
+            load_balance_loss = (
+                self.num_experts * (fraction_tokens * mean_router_prob).sum()
+            )
+
         return load_balance_loss
     
     def get_expert_utilization(self, expert_indices: Tensor) -> Dict[int, int]:
@@ -153,16 +206,16 @@ class ExpertRouter(nn.Module):
 class TieredMoELayer(nn.Module):
     """
     Mixture of Experts layer with tiered storage backend.
-    
+
     This is the main module that combines:
     1. Router (in HBM) - decides which experts to use
     2. TieredExpertStore - manages expert parameters across memory tiers
     3. Expert computation - fetches and applies experts
-    
+
     Key insight: The router learns to predict expert needs, which
     enables the prefetching system to work effectively.
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -170,6 +223,8 @@ class TieredMoELayer(nn.Module):
         expert_store: TieredExpertStore,
         top_k: int = 2,
         dropout: float = 0.1,
+        num_envs: int = 1,
+        env_specialization_strength: float = 2.0,
     ):
         """
         Args:
@@ -178,40 +233,48 @@ class TieredMoELayer(nn.Module):
             expert_store: TieredExpertStore managing expert parameters
             top_k: Number of experts per input
             dropout: Dropout rate
+            num_envs: Number of environments for specialization
+            env_specialization_strength: How strongly to bias by environment
         """
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.expert_store = expert_store
         self.top_k = top_k
-        
+        self.num_envs = num_envs
+
         # Router is always in HBM
         self.router = ExpertRouter(
             input_dim=input_dim,
             num_experts=expert_store.num_experts,
             top_k=top_k,
+            num_envs=num_envs,
+            env_specialization_strength=env_specialization_strength,
         )
-        
+
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(input_dim)
-        
+
         # Track which experts were used (for analysis)
         self.last_expert_indices: Optional[Tensor] = None
         self.last_expert_weights: Optional[Tensor] = None
-    
+        self.last_env_id: Optional[int] = None
+
     def forward(
-        self, 
+        self,
         x: Tensor,
-        context_hash: Optional[int] = None
+        context_hash: Optional[int] = None,
+        env_id: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Forward pass through MoE layer.
-        
+
         Args:
             x: Input tensor [batch, seq_len, dim] or [batch, dim]
             context_hash: Optional context identifier for access tracking
-            
+            env_id: Current environment ID for specialization
+
         Returns:
             output: Transformed tensor (same shape as input)
             aux_loss: Load balancing loss for training
@@ -223,12 +286,13 @@ class TieredMoELayer(nn.Module):
             x = x.reshape(batch * seq_len, dim)
         else:
             seq_len = None
-        
+
         # Normalize input
         x_norm = self.layer_norm(x)
-        
-        # Route to experts
-        router_output = self.router(x_norm, training=self.training)
+
+        # Route to experts (with environment-aware bias)
+        router_output = self.router(x_norm, training=self.training, env_id=env_id)
+        self.last_env_id = env_id
         
         # Store for analysis
         self.last_expert_indices = router_output.expert_indices
@@ -332,12 +396,12 @@ class TieredMoELayer(nn.Module):
 class MoETransformerBlock(nn.Module):
     """
     Transformer block with MoE feedforward layer.
-    
+
     Structure:
     1. Self-attention (dense, in HBM)
     2. MoE FFN (sparse, tiered storage)
     """
-    
+
     def __init__(
         self,
         dim: int,
@@ -346,18 +410,20 @@ class MoETransformerBlock(nn.Module):
         ffn_hidden_dim: int,
         top_k: int = 2,
         dropout: float = 0.1,
+        num_envs: int = 1,
+        env_specialization_strength: float = 2.0,
     ):
         super().__init__()
-        
+
         self.dim = dim
-        
+
         # Self-attention (always in HBM)
         self.attention = nn.MultiheadAttention(
             dim, num_heads, dropout=dropout, batch_first=True
         )
         self.attn_norm = nn.LayerNorm(dim)
         self.attn_dropout = nn.Dropout(dropout)
-        
+
         # MoE feedforward
         self.moe = TieredMoELayer(
             input_dim=dim,
@@ -365,22 +431,26 @@ class MoETransformerBlock(nn.Module):
             expert_store=expert_store,
             top_k=top_k,
             dropout=dropout,
+            num_envs=num_envs,
+            env_specialization_strength=env_specialization_strength,
         )
-    
+
     def forward(
         self,
         x: Tensor,
         attention_mask: Optional[Tensor] = None,
         context_hash: Optional[int] = None,
+        env_id: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Forward pass through transformer block.
-        
+
         Args:
             x: Input [batch, seq_len, dim]
             attention_mask: Optional attention mask
             context_hash: Context identifier for expert tracking
-            
+            env_id: Current environment ID for specialization
+
         Returns:
             output: Transformed tensor
             aux_loss: Load balancing loss
@@ -393,10 +463,10 @@ class MoETransformerBlock(nn.Module):
             need_weights=False
         )
         x = x + self.attn_dropout(attn_out)
-        
+
         # MoE feedforward with residual (handled inside TieredMoELayer)
-        x, aux_loss = self.moe(x, context_hash=context_hash)
-        
+        x, aux_loss = self.moe(x, context_hash=context_hash, env_id=env_id)
+
         return x, aux_loss
     
     def get_last_routing_stats(self) -> Dict:
